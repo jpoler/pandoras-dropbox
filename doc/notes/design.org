@@ -1,0 +1,138 @@
+* notes from https://blogs.dropbox.com/tech/2014/07/streaming-file-synchronization/
+
+** columns in Server File Journal (SFJ)
+   NSID - namespace ID
+   Namespace relative path
+   Blocklist
+   Journal ID (JID)
+
+** Block data server (key-value store of hash to encrypted contents)
+   no knowledge of user/files (these are encrypted)
+** metadata server
+   database of users, namespaces, and SFJ
+
+** protocol (HOORAY! I don't have to figure this out from scratch! I totally would though...)
+*** client keeps a JID of its location in SFJ
+    its "up-to-dateness"
+
+*** file creation
+    commit message to server namespace id (nsid), relative path, hashids
+    sever checks: if hashids are known, if user/namespace has access
+    if access allowed, response is the needed blocks
+    commit(nsid=1, "rel/path", h1,h2,h3,h4)
+
+*** upload to blockserver
+    store([h1, h2], [b1, b2])
+    recieve an ok
+*** download
+    longpolling for download notification
+
+    list(nsids_and_jids={ns: jid, etc.}
+    receive a list of [(ns=val, jid=val, "rel/path", h1,h2,h3,h4)]
+
+    retrieve([h1,h2]) results in ('ok', [b1,b2])
+
+** interesting design points:
+   So useful!
+
+   seperate threads for:
+   sniffing filesystem
+   hashing
+   commit
+   store_batch
+   list
+   retrieve_batch
+   reconstruct
+
+   using compression and rsync
+
+* Client design
+  is it better to assume one user/client per machine?
+
+  the only thing that needs to be stored persistently are the local file system and
+  the current journal id
+
+  simplest possible approach:
+
+  initialize an empty folder
+  on init/startup, the server must be informed of existance of the client in order to authenticate
+  if this is a truly empty folder, the response is [] (json?)
+  client sends a list(ns: 0) to the server
+  otherwise do a list(ns: jid)
+  with the current hashmap based on current jid established, we then start scanning first
+  scan finds files and sends each path to the hashing thread
+  hashing thread hashes filepaths and sends them to commit thread
+  commit thread checks the filepath/hash/ns received and makes commit requests
+  does stores as needed
+  after one scan has been completed, we can then allow the list() retrieve() process to begin
+
+
+
+
+
+** scanning
+   for each namespace, traverse from root
+
+** hashing
+   recieve (ns, jid, path) from scanning
+   hash each file
+   send (ns, jid, path, hash) to commit
+
+** commit
+   receive (ns, jid, path, hash) from hashing
+
+
+   check to see if path/hash is current jid hashmap
+   problems: jid is updated as a file traverses from scanning through hashing before it is checked in commit
+   now we don't know if the file was deleted in the new jid or if the file was added and needs to be committed
+
+   naeve solution: send everything to the server? Let the server decide truth
+
+   better:    each ns has a map of jid maps which has a set that tracks path+hash strings
+   now look up by ns: jid: and check for membership in the set
+
+   when a match is discovered in the map, remove from map
+   when a file is not in the map, add to sequence
+   after traversal, anything left in the map is a delete, add all to sequence
+
+   the above design will notice if a file got changed by retrieve before the server was notified of a change
+   by commit the server can sort out conflicts
+** commit
+   keep a hashmap of all filepaths/hashes as of current jid defaults to {} on jid of 0
+
+
+** what happens when changes to a filepath come in after a list changes the value of our jid hashmap?
+this is where atoms or something similar will have to be used.
+should the client actually be keeping its own database?
+
+** store_batch
+   client sends encrypted file to the server (this should really be S3, but for now through server)
+   receives 'ok'
+
+** list
+   list should allow some sort of slicing
+   like from: jid 0 to: jid: local jid that way you get the full list of current state
+   list runs initially on startup, in order to establish a somewhat consistant local state
+   everything should probably block until after list and then retrieve run
+   -- i question this now, becuase if we update the local state before a scan can take place,
+   -- everything that we did locally offline gets wiped out
+
+
+** retrieve
+   gets all files from s3 directly
+   at first, reconstruct may not be necessary
+   this also means that retrieve must update the local state upon completion i.e. change local hashmap
+
+
+* A locking system is going to be necessary
+
+** mutually exclusive activities:
+   hashing and retrieval of the same filepath
+   actually, from the time scanning a file is begun, a lock must exist through hashing, commit, and send, and the final commit
+   only then after 'ok' comes back from store can the file be unlocked, at that point, list may have brought in new changes
+   for that file, and these can be queued and then added
+
+   read and update of state hashmap
+
+   this mutual lock also goes the other way, a file cannot be scanned while it is being updated. So a scanner will
+   skip any file that currently has a lock, and come back to it afterwards
